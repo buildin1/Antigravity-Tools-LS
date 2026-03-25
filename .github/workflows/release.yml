@@ -66,15 +66,36 @@ jobs:
           tauriScript: npx @tauri-apps/cli@2
           args: ${{ matrix.args }}
 
+      - name: Rename and Prepare Artifacts
+        shell: bash
+        run: |
+          # 提取架构信息用于重命名
+          if [[ "${{ matrix.args }}" == *"--target aarch64"* ]]; then
+            ARCH="aarch64"
+          elif [[ "${{ matrix.args }}" == *"--target x86_64"* ]]; then
+            ARCH="x64"
+          elif [[ "${{ matrix.args }}" == *"--target universal"* ]]; then
+            ARCH="universal"
+          else
+            ARCH="default"
+          fi
+          
+          echo "Renaming artifacts with arch: $ARCH"
+          mkdir -p artifacts-out
+          
+          # 查找并重命名 macos/window/linux 产物，增加架构后缀防止覆盖
+          find target -name "*.dmg" -exec cp {} artifacts-out/Antigravity-Tools-LS_${ARCH}.dmg \; || true
+          find target -name "*.app.tar.gz" -exec cp {} artifacts-out/Antigravity-Tools-LS_${ARCH}.app.tar.gz \; || true
+          find target -name "*.app.tar.gz.sig" -exec cp {} artifacts-out/Antigravity-Tools-LS_${ARCH}.app.tar.gz.sig \; || true
+          find target -name "*.exe" -exec cp {} artifacts-out/ || true
+          find target -name "*.AppImage" -exec cp {} artifacts-out/ || true
+          find target -name "*.AppImage.sig" -exec cp {} artifacts-out/ || true
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-assets-${{ matrix.platform }}-${{ strategy.job-index }}
-          path: |
-            target/**/bundle/macos/*.app.tar.gz*
-            target/**/bundle/macos/*.dmg*
-            target/**/bundle/nsis/*.exe*
-            target/**/bundle/appimage/*.AppImage*
+          path: artifacts-out/*
           if-no-files-found: error
 
 
