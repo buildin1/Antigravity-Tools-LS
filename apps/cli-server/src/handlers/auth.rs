@@ -91,10 +91,9 @@ pub async fn oauth_callback(
 
     let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| format!("http://localhost:{}", state.port));
     let redirect_uri = format!("{}/oauth-callback", base_url);
-    let client_secret = std::env::var("GOOGLE_CLIENT_SECRET_2").unwrap_or_else(|_| "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".to_string());
     let params = [
         ("client_id", GOOGLE_CLIENT_ID_2),
-        ("client_secret", &client_secret),
+        ("client_secret", GOOGLE_CLIENT_SECRET_2),
         ("code", &code),
         ("redirect_uri", &redirect_uri),
         ("grant_type", "authorization_code"),
@@ -220,10 +219,9 @@ pub async fn refresh_token_api(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RefreshTokenReq>,
 ) -> impl IntoResponse {
-    let client_secret = std::env::var("GOOGLE_CLIENT_SECRET_2").unwrap_or_else(|_| "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".to_string());
     let params = [
         ("client_id", GOOGLE_CLIENT_ID_2),
-        ("client_secret", &client_secret),
+        ("client_secret", GOOGLE_CLIENT_SECRET_2),
         ("refresh_token", &payload.refresh_token),
         ("grant_type", "refresh_token"),
     ];
@@ -244,32 +242,26 @@ pub async fn refresh_token_api(
 #[allow(dead_code)]
 pub async fn get_access_token(state: &Arc<AppState>, refresh_token: &str) -> Option<String> {
     // 智能排序：根据 Token 前缀识别来源，减少无效尝试
-    let secrets = [
-        std::env::var("GOOGLE_CLIENT_SECRET_1").unwrap_or_else(|_| "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".to_string()),
-        std::env::var("GOOGLE_CLIENT_SECRET_2").unwrap_or_else(|_| "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".to_string()),
-        std::env::var("GOOGLE_CLIENT_SECRET_3").unwrap_or_else(|_| "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".to_string()),
-    ];
-
     let combinations = if refresh_token.starts_with("1//0e") {
         // 1//0e 开头，优先尝试 Client 2 桌面版
         vec![
-            (GOOGLE_CLIENT_ID_2, &secrets[1]),
-            (GOOGLE_CLIENT_ID_1, &secrets[0]),
-            (GOOGLE_CLIENT_ID_3, &secrets[2]),
+            (GOOGLE_CLIENT_ID_2, GOOGLE_CLIENT_SECRET_2),
+            (GOOGLE_CLIENT_ID_1, GOOGLE_CLIENT_SECRET_1),
+            (GOOGLE_CLIENT_ID_3, GOOGLE_CLIENT_SECRET_3),
         ]
     } else if refresh_token.starts_with("1//09") {
         // 1//09 开头，优先尝试 Client 1 插件版
         vec![
-            (GOOGLE_CLIENT_ID_1, &secrets[0]),
-            (GOOGLE_CLIENT_ID_3, &secrets[2]),
-            (GOOGLE_CLIENT_ID_2, &secrets[1]),
+            (GOOGLE_CLIENT_ID_1, GOOGLE_CLIENT_SECRET_1),
+            (GOOGLE_CLIENT_ID_3, GOOGLE_CLIENT_SECRET_3),
+            (GOOGLE_CLIENT_ID_2, GOOGLE_CLIENT_SECRET_2),
         ]
     } else {
         // 其它
         vec![
-            (GOOGLE_CLIENT_ID_1, &secrets[0]),
-            (GOOGLE_CLIENT_ID_2, &secrets[1]),
-            (GOOGLE_CLIENT_ID_3, &secrets[2]),
+            (GOOGLE_CLIENT_ID_1, GOOGLE_CLIENT_SECRET_1),
+            (GOOGLE_CLIENT_ID_2, GOOGLE_CLIENT_SECRET_2),
+            (GOOGLE_CLIENT_ID_3, GOOGLE_CLIENT_SECRET_3),
         ]
     };
 
@@ -310,29 +302,23 @@ pub async fn get_access_token(state: &Arc<AppState>, refresh_token: &str) -> Opt
 
 // [NEW] 增强版：获取完整的 OAuthToken (包含 expires_in, updated_at 等)
 pub async fn get_access_token_full(state: &Arc<AppState>, refresh_token: &str) -> Option<ls_accounts::OAuthToken> {
-    let secrets = [
-        std::env::var("GOOGLE_CLIENT_SECRET_1").unwrap_or_else(|_| "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".to_string()),
-        std::env::var("GOOGLE_CLIENT_SECRET_2").unwrap_or_else(|_| "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".to_string()),
-        std::env::var("GOOGLE_CLIENT_SECRET_3").unwrap_or_else(|_| "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".to_string()),
-    ];
-
     let combinations = if refresh_token.starts_with("1//0e") {
         vec![
-            (GOOGLE_CLIENT_ID_2, &secrets[1]),
-            (GOOGLE_CLIENT_ID_1, &secrets[0]),
-            (GOOGLE_CLIENT_ID_3, &secrets[2]),
+            (GOOGLE_CLIENT_ID_2, GOOGLE_CLIENT_SECRET_2),
+            (GOOGLE_CLIENT_ID_1, GOOGLE_CLIENT_SECRET_1),
+            (GOOGLE_CLIENT_ID_3, GOOGLE_CLIENT_SECRET_3),
         ]
     } else if refresh_token.starts_with("1//09") {
         vec![
-            (GOOGLE_CLIENT_ID_1, &secrets[0]),
-            (GOOGLE_CLIENT_ID_3, &secrets[2]),
-            (GOOGLE_CLIENT_ID_2, &secrets[1]),
+            (GOOGLE_CLIENT_ID_1, GOOGLE_CLIENT_SECRET_1),
+            (GOOGLE_CLIENT_ID_3, GOOGLE_CLIENT_SECRET_3),
+            (GOOGLE_CLIENT_ID_2, GOOGLE_CLIENT_SECRET_2),
         ]
     } else {
         vec![
-            (GOOGLE_CLIENT_ID_1, &secrets[0]),
-            (GOOGLE_CLIENT_ID_2, &secrets[1]),
-            (GOOGLE_CLIENT_ID_3, &secrets[2]),
+            (GOOGLE_CLIENT_ID_1, GOOGLE_CLIENT_SECRET_1),
+            (GOOGLE_CLIENT_ID_2, GOOGLE_CLIENT_SECRET_2),
+            (GOOGLE_CLIENT_ID_3, GOOGLE_CLIENT_SECRET_3),
         ]
     };
 
@@ -572,10 +558,9 @@ async fn exchange_code_for_account(
         let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| format!("http://localhost:{}", state.port));
         format!("{}/oauth-callback", base_url)
     };
-    let client_secret = std::env::var("GOOGLE_CLIENT_SECRET_2").unwrap_or_else(|_| "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".to_string());
     let params = [
         ("client_id", GOOGLE_CLIENT_ID_2),
-        ("client_secret", &client_secret),
+        ("client_secret", GOOGLE_CLIENT_SECRET_2),
         ("code", code),
         ("redirect_uri", &redirect_uri),
         ("grant_type", "authorization_code"),
