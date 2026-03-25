@@ -30,6 +30,8 @@ import useSettingsStore from '../store/useSettingsStore';
 import useAppStore from '../store/useAppStore';
 import i18n from '../i18n/config';
 import { useTranslation } from 'react-i18next';
+import { baseURL } from '../api/client';
+import { settingsService } from '../api/services/settings';
 
 // ─── Tab 定义 ─────────────────────────────────────────────────────────────────
 const getTabs = (t) => [
@@ -274,7 +276,7 @@ const AssetsTab = ({ provisionStatus, versionInfo, isSyncing, onSync, local, set
     
     // 建立 SSE 监听
     const { fetchProvisionStatus, fetchVersionInfo } = useSettingsStore.getState();
-    const eventSource = new EventSource('/v1/provision/progress');
+    const eventSource = new EventSource(baseURL + '/provision/progress');
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
       setSyncProgress({ 
@@ -494,7 +496,7 @@ const IdeTab = ({ local, setLocal }) => {
                    <button 
                     onClick={async () => {
                       try {
-                        const res = await fetch('/v1/provision/select_path').then(r => r.json());
+                        const res = await settingsService.selectPath();
                         if (res.success) {
                           setLocal(s => ({ ...s, antigravity_executable: res.executable_path }));
                         }
@@ -509,7 +511,7 @@ const IdeTab = ({ local, setLocal }) => {
                    <button 
                     onClick={async () => {
                       try {
-                        const res = await fetch('/v1/provision/detect_ide').then(r => r.json());
+                        const res = await settingsService.detectIde();
                         if (res.success) {
                           setLocal(s => ({ 
                             ...s, 

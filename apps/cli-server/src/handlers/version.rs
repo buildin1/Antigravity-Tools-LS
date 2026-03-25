@@ -1,9 +1,12 @@
 use axum::{
+    extract::State,
     response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
+use crate::state::AppState;
 use transcoder_core::transcoder::VersionManager;
 
 #[derive(Serialize, Deserialize)]
@@ -24,8 +27,15 @@ struct GitHubRelease {
 
 /// GET /v1/version
 /// 获取三个维度的 Antigravity 版本信息
-pub async fn get_version_info_api() -> impl IntoResponse {
-    let info = VersionManager::get_all_version_info().await;
+pub async fn get_version_info_api(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let custom_path = {
+        let settings = state.app_settings.read().await;
+        settings.antigravity_executable.clone()
+    };
+
+    let info = VersionManager::get_all_version_info(custom_path).await;
     
     Json(json!({
         "success": true,

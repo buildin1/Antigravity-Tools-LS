@@ -9,7 +9,8 @@ const isTauri = typeof window !== 'undefined' && (
 );
 
 // 生产环境下强制直连 Axum (127.0.0.1:5173)，开发环境下使用 Vite Proxy (/v1)
-const baseURL = isTauri ? 'http://127.0.0.1:5173/v1' : '/v1';
+export const baseURL = isTauri ? 'http://127.0.0.1:5173/v1' : '/v1';
+export { isTauri };
 
 const apiClient = axios.create({
   baseURL,
@@ -25,7 +26,8 @@ apiClient.interceptors.response.use(
     // 如果后端返回结构是 { success: true, data: ... }
     if (response.data && typeof response.data === 'object' && 'success' in response.data) {
       if (response.data.success) {
-        return response.data.data;
+        // 只有当存在 data 字段时才解包，否则返回整个 response.data
+        return 'data' in response.data ? response.data.data : response.data;
       } else {
         return Promise.reject(new Error(response.data.message || '业务逻辑错误'));
       }

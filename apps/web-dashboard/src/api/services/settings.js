@@ -18,4 +18,10 @@ export const settingsService = {
 
   // 检查系统更新
   checkVersion: () => apiClient.get('/version/check'),
+
+  // 选择安装路径 [NEW]
+  selectPath: () => apiClient.get('/provision/select_path'),
+
+  // 探测 IDE [NEW]
+  detectIde: () => apiClient.get('/provision/detect_ide'),
 };

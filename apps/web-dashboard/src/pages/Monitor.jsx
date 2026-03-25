@@ -17,6 +17,8 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { ConfirmModal } from '../components/Modal';
+import { baseURL } from '../api/client';
+import { monitorService } from '../api/services/monitor';
 
 const Monitor = () => {
   const { t } = useTranslation();
@@ -42,12 +44,11 @@ const Monitor = () => {
 
   useEffect(() => {
     // 1. 流量日志订阅
-    fetch('/v1/monitor/logs?limit=50')
-      .then(res => res.json())
+    monitorService.getTrafficLogs(50)
       .then(data => Array.isArray(data) && setLogs(data))
       .catch(err => console.error("Traffic history failed:", err));
 
-    const tES = new EventSource('/v1/monitor/stream');
+    const tES = new EventSource(baseURL + '/monitor/stream');
     tES.onmessage = (event) => {
       if (isPausedRef.current) return;
       try {
@@ -58,12 +59,11 @@ const Monitor = () => {
     trafficESRef.current = tES;
 
     // 2. 系统日志订阅
-    fetch('/v1/logs')
-      .then(res => res.json())
+    monitorService.getSystemLogs()
       .then(data => data.lines && setSysLogs(data.lines.reverse())) // 保持最新在前
       .catch(err => console.error("Sys history failed:", err));
 
-    const sES = new EventSource('/v1/logs/stream');
+    const sES = new EventSource(baseURL + '/logs/stream');
     sES.onmessage = (event) => {
       if (isPausedRef.current) return;
       try {
@@ -153,12 +153,12 @@ const Monitor = () => {
     setIsDeleteModalOpen(false);
     if (activeTab === 'traffic') {
       try {
-        await fetch('/v1/monitor/logs', { method: 'DELETE' });
+        await monitorService.clearTrafficLogs();
       } catch (err) {}
       setLogs([]);
     } else {
       try {
-        await fetch('/v1/logs', { method: 'DELETE' });
+        await monitorService.clearSystemLogs();
       } catch (err) {}
       setSysLogs([]);
     }

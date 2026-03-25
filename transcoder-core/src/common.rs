@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::fs;
 use std::sync::Arc;
+use tracing::info;
 
 /// 抽象错误抓取接口，用于从底层实例获取原始 stderr 报错
 pub trait ErrorFetcher: Send + Sync {
@@ -123,4 +124,24 @@ pub fn get_runtime_config() -> LsConfig {
 /// 保留兼容性方法，仅返回版本
 pub fn get_runtime_version() -> String {
     get_runtime_config().version
+}
+
+/// 🚀 增强：从持久化的 app_settings.json 中读取保存的自定义路径
+/// 该路径由 cli-server 探测或用户手动选择并保存
+pub fn get_saved_antigravity_path() -> Option<PathBuf> {
+    let settings_path = get_app_data_dir().join("app_settings.json");
+    if settings_path.exists() {
+        if let Ok(content) = fs::read_to_string(&settings_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(path_str) = json.get("antigravity_executable").and_then(|v| v.as_str()) {
+                    if !path_str.trim().is_empty() {
+                        let path = PathBuf::from(path_str);
+                        info!("📂 从 app_settings.json 读取到自定义路径: {:?}", path);
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
 }

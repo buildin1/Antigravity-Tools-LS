@@ -25,6 +25,7 @@ import AddAccountModal from '../components/AddAccountModal';
 import { BaseModal, ConfirmModal } from '../components/Modal';
 import { useTranslation } from 'react-i18next';
 import { useSpotlight } from '../hooks/useSpotlight';
+import { baseURL } from '../api/client';
 
 // 指定要展示的核心代表性模型 (通过代表项观察同家族配额)
 const RECOMMENDED_MODELS = [
@@ -856,7 +857,7 @@ const Accounts = () => {
   // 🚀 实时同步逻辑: 监听后端 SSE 事件并自动刷新页面
   useEffect(() => {
     // 监听账号变更事件流
-    const eventSource = new EventSource('/v1/accounts/events');
+    const eventSource = new EventSource(baseURL + '/accounts/events');
 
     eventSource.onmessage = (event) => {
       console.log('📬 收到账号变更通知:', event.data);

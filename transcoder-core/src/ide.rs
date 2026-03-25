@@ -166,18 +166,32 @@ fn get_process_info() -> (Option<PathBuf>, Option<PathBuf>) {
 }
 
 /// 获取 Antigravity 可执行文件路径
-/// 优先级：1. 手动指定 2. 运行进程探测 3. 标准路径轮询
+/// 优先级：1. 配置文件已保存路径 2. 手动环境变量指定 3. 运行进程探测 4. 标准路径轮询
 pub fn get_antigravity_executable_path() -> Option<PathBuf> {
-    // 1. 尝试从环境变量获取手动指定路径 (由 cli-server 注入)
+    // 1. 尝试从配置文件获取已保存的路径 (持久化设置)
+    if let Some(saved) = crate::common::get_saved_antigravity_path() {
+        if saved.exists() { 
+            info!("🎯 使用持久化配置中的 IDE 路径: {:?}", saved);
+            return Some(saved); 
+        }
+    }
+
+    // 2. 尝试从环境变量获取手动指定路径 (由 cli-server 注入或临时覆盖)
     if let Ok(manual) = std::env::var("ANT_EXECUTABLE_PATH") {
         let path = PathBuf::from(manual);
-        if path.exists() { return Some(path); }
+        if path.exists() { 
+            info!(" env: 使用环境变量指定的 IDE 路径: {:?}", path);
+            return Some(path); 
+        }
     }
 
     // 2. 尝试从运行中的进程探测
     let (process_path, _) = get_process_info();
     if let Some(path) = process_path {
-        if path.exists() { return Some(path); }
+        if path.exists() { 
+            info!("🔍 通过运行中进程探测到 IDE 路径: {:?}", path);
+            return Some(path); 
+        }
     }
 
     // 3. 轮询标准安装路径

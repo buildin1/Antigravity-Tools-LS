@@ -16,9 +16,9 @@ pub struct VersionManager;
 
 impl VersionManager {
     /// 获取全量版本信息
-    pub async fn get_all_version_info() -> AntigravityVersionInfo {
+    pub async fn get_all_version_info(custom_path: Option<String>) -> AntigravityVersionInfo {
         let simulated_version = crate::common::get_runtime_version();
-        let local_app_version = Self::detect_local_version();
+        let local_app_version = Self::detect_local_version(custom_path);
         let remote_latest_version = Self::fetch_remote_version().await;
 
         AntigravityVersionInfo {
@@ -29,14 +29,65 @@ impl VersionManager {
     }
 
     /// 探测本地安装的 Antigravity 版本
-    fn detect_local_version() -> Option<String> {
+    fn detect_local_version(custom_path: Option<String>) -> Option<String> {
+        // 1. 优先级：外部传入路径 -> 配置文件已保存路径
+        let target_path = custom_path
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| crate::common::get_saved_antigravity_path());
+
+        if let Some(path) = target_path {
+            info!("🔍 正在从路径探测版本信息: {:?}", path);
+            if path.exists() {
+                #[cfg(target_os = "macos")]
+                {
+                    // 如果指向 .app，自动进入 Contents/Info.plist
+                    let plist_path = if path.extension().and_then(|s| s.to_str()) == Some("app") {
+                        path.join("Contents/Info.plist")
+                    } else if path.ends_with("Contents/MacOS/Antigravity") {
+                        path.parent().and_then(|p| p.parent()).map(|p| p.join("Info.plist")).unwrap_or(path)
+                    } else {
+                        path
+                    };
+
+                    if let Ok(content) = std::fs::read(&plist_path) {
+                        if let Ok(plist) = plist::Value::from_reader(std::io::Cursor::new(content)) {
+                            if let Some(dict) = plist.as_dictionary() {
+                                if let Some(v) = dict.get("CFBundleShortVersionString").and_then(|v| v.as_string()) {
+                                    return Some(v.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // Windows/Linux: 尝试查找同级或 resources/app 下的 package.json
+                    let possible_json = if path.is_file() {
+                        path.parent().map(|p| p.join("resources/app/package.json")).unwrap_or(path.clone())
+                    } else {
+                        path.join("resources/app/package.json")
+                    };
+
+                    if let Ok(content) = std::fs::read_to_string(&possible_json) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(v) = json.get("version").and_then(|v| v.as_str()) {
+                                return Some(v.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 兜底默认路径探测
         #[cfg(target_os = "macos")]
         {
             let paths = [
                 "/Applications/Antigravity.app/Contents/Info.plist",
-                "/Applications/Cursor.app/Contents/Info.plist", // 兼容
+                "/Applications/Cursor.app/Contents/Info.plist",
             ];
-
             for path in &paths {
                 if let Ok(content) = std::fs::read(path) {
                     if let Ok(plist) = plist::Value::from_reader(std::io::Cursor::new(content)) {
@@ -52,7 +103,6 @@ impl VersionManager {
 
         #[cfg(target_os = "windows")]
         {
-            // Windows 逻辑通常在 AppData 下
             if let Ok(user_profile) = std::env::var("USERPROFILE") {
                 let path = std::path::Path::new(&user_profile)
                     .join("AppData\\Local\\Programs\\Antigravity\\resources\\app\\package.json");
