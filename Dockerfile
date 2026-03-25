@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # 复制工作空间配置并动态清理无关成员
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 RUN sed -i '/"apps\/desktop\/src-tauri"/d' Cargo.toml
 
 # 复制核心后端源码
