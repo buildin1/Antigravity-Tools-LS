@@ -71,10 +71,10 @@ jobs:
         with:
           name: release-assets-${{ matrix.platform }}-${{ strategy.job-index }}
           path: |
-            apps/desktop/src-tauri/target/**/bundle/macos/*.app.tar.gz*
-            apps/desktop/src-tauri/target/**/bundle/macos/*.dmg*
-            apps/desktop/src-tauri/target/**/bundle/nsis/*.exe*
-            apps/desktop/src-tauri/target/**/bundle/appimage/*.AppImage*
+            target/**/bundle/macos/*.app.tar.gz*
+            target/**/bundle/macos/*.dmg*
+            target/**/bundle/nsis/*.exe*
+            target/**/bundle/appimage/*.AppImage*
           if-no-files-found: error
 
 
