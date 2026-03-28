@@ -1,5 +1,20 @@
 # 🚀 Antigravity Tools LS
 
+---
+
+## 🍴 本 Fork (buildin1) 专有更新说明
+
+本项目基于原作者版进行深度二次开发，主要针对 **思考链 (Thinking Chain)** 与 **中文推理体验** 进行了以下优化：
+
+- **深度思考链 (CoT) 解析**：完美提取并对齐官方 Cascade 协议中的 `thinking` 字段，支持在 RikkaHub 等客户端中以“折叠卡片”形式展现推理过程。
+- **虚拟思考链 (VCoT)**：针对 **Gemini 2.0 Flash Lite** 等原生不支持思考的模型，通过 `<thought>` 标签拦截技术模拟推理流。
+- **中文推理强制引导**：全量注入指令，确保所有模型的推理过程均使用 **中文**（拒绝混杂英文思考）。
+- **多模态图像识别修复**：修复了双字段传输逻辑，大幅提升第三方客户端（如 NextChat）在多模态模型上的图片识别成功率。
+- **全平台自动化构建**：集成了 GitHub Actions，支持 Windows、Linux、macOS (x64/ARM64) 自动云端打包发行版（在 Actions 选项卡手动触发）。
+- **版本对齐声明**：本 fork 保持与上游版本号 (`0.0.3`) 同步，不进行独立版本变动，仅作为功能增强分支。
+
+---
+
 > **专业级 Language Server 协议转码桥接器 (v0.0.3)**
 
 <p align="center">
@@ -268,17 +283,3 @@ docker run -d \
 
 <p align="center">Made with Rust 🦀 by [lbjlaq](https://github.com/lbjlaq)</p>
 
----
-
-## 🍴 本 Fork (buildin1) 专有更新说明
-
-本项目基于原作者版进行深度二次开发，主要针对 **思考链 (Thinking Chain)** 与 **中文推理体验** 进行了以下优化：
-
-- **深度思考链 (CoT) 解析**：完美提取并对齐官方 Cascade 协议中的 `thinking` 字段，支持在 RikkaHub 等客户端中以“折叠卡片”形式展现推理过程。
-- **虚拟思考链 (VCoT)**：针对 **Gemini 2.0 Flash Lite** 等原生不支持思考的模型，通过 `<thought>` 标签拦截技术模拟推理流。
-- **中文推理强制引导**：全量注入指令，确保所有模型的推理过程均使用 **中文**（拒绝混杂英文思考）。
-- **多模态图像识别修复**：修复了双字段传输逻辑，大幅提升第三方客户端（如 NextChat）在多模态模型上的图片识别成功率。
-- **全平台自动化构建**：集成了 GitHub Actions，支持 Windows、Linux、macOS (x64/ARM64) 自动云端打包发行版（在 Actions 选项卡手动触发）。
-- **版本对齐声明**：本 fork 保持与上游版本号 (`0.0.3`) 同步，不进行独立版本变动，仅作为功能增强分支。
-
-感谢原作者 [lbjlaq](https://github.com/lbjlaq) 的优秀开源工作！
