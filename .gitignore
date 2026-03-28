@@ -31,3 +31,7 @@ Icon
 .Trashes
 
 pull_request/
+
+# 排除参考项目
+rikkahub-repo/
+tmp_manager/
