@@ -6,11 +6,16 @@ use crate::proto::exa::language_server_pb::{
 use crate::proto::exa::cortex_pb::{CortexTrajectoryType, CascadeRunStatus, CortexStepType, CortexStepStatus};
 use crate::proto::exa::codeium_common_pb::{Metadata, TextOrScopeItem};
 use crate::proto::exa::reactive_component_pb::{StreamReactiveUpdatesRequest, MessageDiff};
+use crate::mappers::CascadeDelta; // 👈 引入新的增量类型
 use tokio::time::sleep;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
 pub struct CascadeClient {
+// ... (omitting new() for brevity, it's already there)
+// Wait, I should include the whole impl block or use replace_file_content carefully.
+
+// Let's refine the replacement to the chat_stream method.
     client: LanguageServerServiceClient<Channel>,
     metadata: Metadata,
     auth_token: String,
@@ -157,11 +162,31 @@ impl CascadeClient {
     }
 
     /// 发起一次 Cascade 对话并开启流式增量输出
-    pub async fn chat_stream(&mut self, user_text: String, model_id: i32) -> anyhow::Result<tokio::sync::mpsc::Receiver<Result<String, tonic::Status>>> {
+    pub async fn chat_stream(
+        &mut self, 
+        user_text: String, 
+        model_id: i32, 
+        images: Vec<crate::proto::exa::codeium_common_pb::ImageData>,
+        media: Vec<crate::proto::exa::codeium_common_pb::Media>,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<CascadeDelta, tonic::Status>>, anyhow::Error> {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let model_enum = model_id;
         let mut client_clone = self.client.clone();
         let csrf_token_clone = self.auth_token.clone();
+
+        // 构造统一的 CascadeConfig
+        let cascade_config = Some(crate::proto::exa::cortex_pb::CascadeConfig {
+            planner_config: Some(crate::proto::exa::cortex_pb::CascadePlannerConfig {
+                requested_model: Some(crate::proto::exa::codeium_common_pb::ModelOrAlias {
+                    choice: Some(crate::proto::exa::codeium_common_pb::model_or_alias::Choice::Model(model_enum)),
+                }),
+                planner_type_config: Some(crate::proto::exa::cortex_pb::cascade_planner_config::PlannerTypeConfig::Conversational(
+                    crate::proto::exa::cortex_pb::CascadeConversationalPlannerConfig::default()
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
 
         // 1. StartCascade
         let start_req = StartCascadeRequest {
@@ -176,6 +201,10 @@ impl CascadeClient {
         let cascade_id = start_resp.cascade_id;
         tracing::info!("🚀 [Cascade] 已启动会话 (流流结合): {}", cascade_id);
 
+        if !images.is_empty() {
+            tracing::info!("📸 [Cascade] 当前请求包含 {} 张图片(Base64) 和 {} 个媒体对象", images.len(), media.len());
+        }
+
         // 2. SendUserCascadeMessage
         let send_req = SendUserCascadeMessageRequest {
             metadata: Some(self.metadata.clone()),
@@ -183,18 +212,9 @@ impl CascadeClient {
             items: vec![TextOrScopeItem {
                 chunk: Some(crate::proto::exa::codeium_common_pb::text_or_scope_item::Chunk::Text(user_text)),
             }],
-            cascade_config: Some(crate::proto::exa::cortex_pb::CascadeConfig {
-                planner_config: Some(crate::proto::exa::cortex_pb::CascadePlannerConfig {
-                    requested_model: Some(crate::proto::exa::codeium_common_pb::ModelOrAlias {
-                        choice: Some(crate::proto::exa::codeium_common_pb::model_or_alias::Choice::Model(model_enum)),
-                    }),
-                    planner_type_config: Some(crate::proto::exa::cortex_pb::cascade_planner_config::PlannerTypeConfig::Conversational(
-                        crate::proto::exa::cortex_pb::CascadeConversationalPlannerConfig::default()
-                    )),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+            images,
+            media,
+            cascade_config,
             ..Default::default()
         };
         self.client.send_user_cascade_message(self.auth_request(send_req)).await.map_err(|status| {
@@ -202,34 +222,12 @@ impl CascadeClient {
             anyhow::anyhow!("SendUserCascadeMessage 错误 [{}]: {}", status.code(), status.message())
         })?;
 
-        // 3. 开启原生 Reactive 订阅流 + 轮询 Fallback
+        // 3. 轮询 Fallback 与 最终快照确认
         tokio::spawn(async move {
-            let mut last_sent_len = 0;
-
-            // --- 策略 A: 优先使用原生的 StreamCascadeReactiveUpdates ---
-            let stream_req = StreamReactiveUpdatesRequest {
-                protocol_version: 1,
-                id: cascade_id.clone(),
-                subscriber_id: uuid::Uuid::new_v4().to_string(),
-            };
-            
-            // ⚠️ 紧急修补：PR 7 中补齐了 CSRF Token，导致原本会被服务器 403 拒绝的
-            // Reactive Stream 成功建立了连接。但由于目前解析 `diff` 结构可能未完全对齐新版，
-            // 或者此端点流机制极易卡死（挂起不发数据），进而导致此处的 `stream.next().await` 死锁，
-            // 并阻断了下方能稳健出字的【策略 B：轮询兜底快照】的执行！
-            // 
-            // 在协议彻底对齐前，强制屏蔽策略 A，全部降级执行轮询：
-            // (修复 E0412 编译错误，直接强制跳过此块即可，无需显式 Option 类型推断)
-
-            if false {
-                // 原有的流处理逻辑被屏蔽
-                let mut fake_stream = tokio_stream::empty::<i32>();
-                while let Some(_) = fake_stream.next().await {}
-            }
-
-            // --- 策略 B: 轮询 Fallback 与 最终快照确认 ---
-            // 即使策略 A 跑完了或者挂了，我们也需要通过轮询确认最终状态 (是否 Done/Error)
+            let mut last_text_sent_len = 0;
+            let mut last_thinking_sent_len = 0;
             let mut retry_count = 0;
+
             loop {
                 let mut req = Request::new(GetCascadeTrajectoryRequest {
                     cascade_id: cascade_id.clone(),
@@ -241,31 +239,37 @@ impl CascadeClient {
                     Ok(resp) => {
                         let traj_resp = resp.into_inner();
                         if let Some(traj) = &traj_resp.trajectory {
-                            // 增量补发逻辑
-                            let full_text = traj.steps.iter().rev()
+                            // 查找最新的 PlannerResponse
+                            let planner_res = traj.steps.iter().rev()
                                 .filter(|s| s.r#type == CortexStepType::PlannerResponse as i32)
                                 .find_map(|s| {
                                     if let Some(crate::proto::gemini_coder::step::Step::PlannerResponse(pr)) = &s.step {
-                                        Some(pr.response.clone())
+                                        Some(pr)
                                     } else { None }
-                                }).unwrap_or_default();
+                                });
 
-                            if full_text.len() > last_sent_len {
-                                let delta = &full_text[last_sent_len..];
-                                if tx.send(Ok(delta.to_string())).await.is_err() { break; }
-                                last_sent_len = full_text.len();
+                            if let Some(pr) = planner_res {
+                                // 处理正文 Text
+                                if pr.response.len() > last_text_sent_len {
+                                    let delta = &pr.response[last_text_sent_len..];
+                                    if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
+                                    last_text_sent_len = pr.response.len();
+                                }
+                                // 处理思考链 Thinking (字段 3)
+                                if pr.thinking.len() > last_thinking_sent_len {
+                                    let delta = &pr.thinking[last_thinking_sent_len..];
+                                    if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
+                                    last_thinking_sent_len = pr.thinking.len();
+                                }
                             }
 
-                            // 状态退出逻辑：对齐 ls-transcoder-rs1 的退出条件
-                            // rs1: Idle && retry_count > 10，无条件退出，不管有没有内容
+                            // 状态退出逻辑
                             if traj_resp.status == CascadeRunStatus::Idle as i32 && retry_count > 10 {
                                 break;
                             }
                         }
                         
-                        // 紧急兜底逻辑：防止任何情况下无限循环
-                        if retry_count > 100 {
-                             tracing::warn!("⚠️ [Cascade] 超过最大轮询次数 (100), 强制退出");
+                        if retry_count > 120 { // 约 1 分钟超时
                              break;
                         }
                     }

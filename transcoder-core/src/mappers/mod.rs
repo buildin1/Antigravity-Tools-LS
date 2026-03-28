@@ -7,11 +7,29 @@ pub mod anthropic;
 pub mod gemini;
 pub mod engine;
 
+use crate::proto::exa::codeium_common_pb::{ImageData, Media};
+
 /// 映射后的增量响应块
 #[derive(Debug, Clone)]
 pub struct MapperChunk {
     pub event: Option<String>,
     pub data: String,
+}
+
+/// 底层 Cascade 返回的聚合增量数据类型
+/// 考虑到有的模型同时输出思考内容与最终文本，我们需要在流中区分它们。
+#[derive(Debug, Clone)]
+pub enum CascadeDelta {
+    Text(String),
+    Thinking(String),
+}
+
+/// 解析后的请求信息（含图片）
+#[derive(Debug, Clone)]
+pub struct ParsedPrompt {
+    pub text: String,
+    pub images: Vec<ImageData>,
+    pub media: Vec<Media>,
 }
 
 /// 流式传输的元数据，在流结束时发送
@@ -34,13 +52,13 @@ pub trait ProtocolMapper: Send + Sync + 'static {
     /// 获取模型名称
     fn get_model(req: &Self::Request) -> &str;
 
-    /// 将原始请求转换为底层的 Prompt 字符串
-    fn build_prompt(req: &Self::Request) -> Result<String>;
+    /// 将原始请求转换为底层的 Prompt 与图片数据
+    fn build_prompt(req: &Self::Request) -> Result<ParsedPrompt>;
 
-    /// 处理底层的增量文本，转换为特定协议的流式响应格式（Chunk）
+    /// 处理底层的增量数据，转换为特定协议的流式响应格式（Chunk）
     async fn map_delta(
         model: &str,
-        delta: String,
+        delta: CascadeDelta, // 改为使用 CascadeDelta
         is_final: bool,
         tool_call_buffer: &mut String,
         in_tool_call: &mut bool,

@@ -18,8 +18,11 @@ impl ProtocolMapper for AnthropicMapper {
         &req.model
     }
 
-    fn build_prompt(req: &Self::Request) -> Result<String> {
+    fn build_prompt(req: &Self::Request) -> Result<crate::mappers::ParsedPrompt> {
         let mut prompt = String::new();
+        let mut images = Vec::new();
+        let mut media = Vec::new();
+
         if let Some(tools) = &req.tools {
             let unified_tools = tools.iter().map(|t| crate::tools::UnifiedToolDefinition {
                 name: t.name.clone(),
@@ -50,6 +53,33 @@ impl ProtocolMapper for AnthropicMapper {
                         match type_str {
                             "text" => {
                                 if let Some(t) = block.get("text").and_then(|v| v.as_str()) { prompt.push_str(t); }
+                            }
+                            "image" => {
+                                if let Some(source) = block.get("source") {
+                                    if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
+                                        if let Some(data) = source.get("data").and_then(|d| d.as_str()) {
+                                            let mime_type = source.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/jpeg").to_string();
+                                            
+                                            use base64::Engine as _;
+                                            let decoded = base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default();
+
+                                            images.push(crate::proto::exa::codeium_common_pb::ImageData {
+                                                base64_data: data.to_string(),
+                                                mime_type: mime_type.clone(),
+                                                caption: String::new(),
+                                                uri: String::new(),
+                                            });
+                                            media.push(crate::proto::exa::codeium_common_pb::Media {
+                                                mime_type: mime_type.clone(),
+                                                description: String::new(),
+                                                uri: String::new(),
+                                                thumbnail: vec![],
+                                                duration_seconds: 0.0,
+                                                payload: Some(crate::proto::exa::codeium_common_pb::media::Payload::InlineData(decoded)),
+                                            });
+                                        }
+                                    }
+                                }
                             }
                             "tool_use" => {
                                 if let Some(n) = block.get("name").and_then(|v| v.as_str()) {
@@ -83,7 +113,7 @@ impl ProtocolMapper for AnthropicMapper {
             }
             prompt.push('\n');
         }
-        Ok(prompt)
+        Ok(crate::mappers::ParsedPrompt { text: prompt, images, media })
     }
 
     fn initial_chunks() -> Vec<MapperChunk> {
@@ -101,7 +131,7 @@ impl ProtocolMapper for AnthropicMapper {
 
     async fn map_delta(
         _model: &str,
-        delta: String,
+        delta: crate::mappers::CascadeDelta, // Update to CascadeDelta
         is_final: bool,
         tool_call_buffer: &mut String,
         in_tool_call: &mut bool,
@@ -119,75 +149,84 @@ impl ProtocolMapper for AnthropicMapper {
             return Ok(results);
         }
 
-        let mut pending_text = delta;
-        while !pending_text.is_empty() {
-            if !*in_tool_call {
-                if let Some(start_idx) = pending_text.find("<tool_call>") {
-                    let before_text = &pending_text[..start_idx];
-                    let current_text_index = *tool_call_index * 2;
-                    if !before_text.is_empty() {
-                        let delta_json = json!({ "type": "content_block_delta", "index": current_text_index, "delta": { "type": "text_delta", "text": before_text } });
-                        results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
-                    }
-                    *in_tool_call = true;
-                    // Stop current text block
-                    results.push(MapperChunk { event: Some("content_block_stop".into()), data: format!(r#"{{"type":"content_block_stop","index":{}}}"#, current_text_index) });
+        match delta {
+            crate::mappers::CascadeDelta::Thinking(_) => {
+                // 🚀 Anthropic 原生协议尚无标准 Reasoning 块，且用户要求不出现在正文。
+                // 因此在这里我们跳过 Thinking 块的处理，或者未来可以映射为特定的 content block 类型。
+                return Ok(results);
+            }
+            crate::mappers::CascadeDelta::Text(text) => {
+                let mut pending_text = text;
+                while !pending_text.is_empty() {
+                    if !*in_tool_call {
+                        if let Some(start_idx) = pending_text.find("<tool_call>") {
+                            let before_text = &pending_text[..start_idx];
+                            let current_text_index = *tool_call_index * 2;
+                            if !before_text.is_empty() {
+                                let delta_json = json!({ "type": "content_block_delta", "index": current_text_index, "delta": { "type": "text_delta", "text": before_text } });
+                                results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
+                            }
+                            *in_tool_call = true;
+                            // Stop current text block
+                            results.push(MapperChunk { event: Some("content_block_stop".into()), data: format!(r#"{{"type":"content_block_stop","index":{}}}"#, current_text_index) });
 
-                    pending_text = pending_text[start_idx + "<tool_call>".len()..].to_string();
-                } else {
-                    let text_index = *tool_call_index * 2;
-                    let delta_json = json!({ "type": "content_block_delta", "index": text_index, "delta": { "type": "text_delta", "text": pending_text } });
-                    results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
-                    pending_text = String::new();
-                }
-            } else {
-                if let Some(end_idx) = pending_text.find("</tool_call>") {
-                    let inner_text = &pending_text[..end_idx];
-                    tool_call_buffer.push_str(inner_text);
-                    
-                    let trim_buf = tool_call_buffer.trim();
-                    let tool_idx = *tool_call_index * 2 + 1; // Tool block index
-                    let next_text_idx = *tool_call_index * 2 + 2; // Next text block index
-
-                    if !trim_buf.is_empty() {
-                        if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(trim_buf) {
-                            let name = json_obj.get("name").and_then(|v| v.as_str()).unwrap_or("unknown_tool").to_string();
-                            let args = json_obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                            
-                            results.push(MapperChunk {
-                                event: Some("content_block_start".into()),
-                                data: json!({ "type": "content_block_start", "index": tool_idx, "content_block": { "type": "tool_use", "id": format!("toolu_cascade_{}", *tool_call_index), "name": name, "input": {} } }).to_string(),
-                            });
-                            
-                            let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
-                            results.push(MapperChunk {
-                                event: Some("content_block_delta".into()),
-                                data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "input_json_delta", "partial_json": args_str } }).to_string(),
-                            });
-                            
-                            results.push(MapperChunk {
-                                event: Some("content_block_stop".into()),
-                                data: json!({ "type": "content_block_stop", "index": tool_idx }).to_string(),
-                            });
-                            *tool_call_index += 1;
+                            pending_text = pending_text[start_idx + "<tool_call>".len()..].to_string();
                         } else {
-                            let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
-                            results.push(MapperChunk {
-                                event: Some("content_block_delta".into()),
-                                data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "text_delta", "text": fallback } }).to_string()
-                            });
+                            let text_index = *tool_call_index * 2;
+                            let delta_json = json!({ "type": "content_block_delta", "index": text_index, "delta": { "type": "text_delta", "text": pending_text } });
+                            results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
+                            pending_text = String::new();
+                        }
+                    } else {
+                        if let Some(end_idx) = pending_text.find("</tool_call>") {
+                            let inner_text = &pending_text[..end_idx];
+                            tool_call_buffer.push_str(inner_text);
+                            
+                            let trim_buf = tool_call_buffer.trim();
+                            let tool_idx = *tool_call_index * 2 + 1; // Tool block index
+                            let next_text_idx = *tool_call_index * 2 + 2; // Next text block index
+
+                            if !trim_buf.is_empty() {
+                                if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(trim_buf) {
+                                    let name = json_obj.get("name").and_then(|v| v.as_str()).unwrap_or("unknown_tool").to_string();
+                                    let args = json_obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                                    
+                                    results.push(MapperChunk {
+                                        event: Some("content_block_start".into()),
+                                        data: json!({ "type": "content_block_start", "index": tool_idx, "content_block": { "type": "tool_use", "id": format!("toolu_cascade_{}", *tool_call_index), "name": name, "input": {} } }).to_string(),
+                                    });
+                                    
+                                    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                                    results.push(MapperChunk {
+                                        event: Some("content_block_delta".into()),
+                                        data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "input_json_delta", "partial_json": args_str } }).to_string(),
+                                    });
+                                    
+                                    results.push(MapperChunk {
+                                        event: Some("content_block_stop".into()),
+                                        data: json!({ "type": "content_block_stop", "index": tool_idx }).to_string(),
+                                    });
+                                    *tool_call_index += 1;
+                                } else {
+                                    let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
+                                    results.push(MapperChunk {
+                                        event: Some("content_block_delta".into()),
+                                        data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "text_delta", "text": fallback } }).to_string()
+                                    });
+                                }
+                            }
+
+                            pending_text = pending_text[end_idx + "</tool_call>".len()..].to_string();
+                            *in_tool_call = false;
+                            tool_call_buffer.clear();
+                            
+                            // Open the next text block
+                            results.push(MapperChunk { event: Some("content_block_start".into()), data: format!(r#"{{"type":"content_block_start","index":{},"content_block":{{"type":"text","text":""}}}}"#, next_text_idx) });
+                        } else {
+                            tool_call_buffer.push_str(&pending_text);
+                            pending_text = String::new();
                         }
                     }
-
-                    pending_text = pending_text[end_idx + "</tool_call>".len()..].to_string();
-                    *in_tool_call = false;
-                    tool_call_buffer.clear();
-                    
-                    // Open the next text block
-                    results.push(MapperChunk { event: Some("content_block_start".into()), data: format!(r#"{{"type":"content_block_start","index":{},"content_block":{{"type":"text","text":""}}}}"#, next_text_idx) });
-                } else {
-                    tool_call_buffer.push_str(&pending_text);
-                    pending_text = String::new();
                 }
             }
         }

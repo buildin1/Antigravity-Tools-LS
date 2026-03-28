@@ -1,0 +1,1213 @@
+diff --git a/apps/web-dashboard/package-lock.json b/apps/web-dashboard/package-lock.json
+index efe3f5b..629456e 100644
+--- a/apps/web-dashboard/package-lock.json
++++ b/apps/web-dashboard/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "web-dashboard",
+-  "version": "0.0.2",
++  "version": "0.0.3",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "web-dashboard",
+-      "version": "0.0.2",
++      "version": "0.0.3",
+       "dependencies": {
+         "@dnd-kit/core": "^6.3.1",
+         "@dnd-kit/sortable": "^10.0.0",
+diff --git a/transcoder-core/src/cascade/client.rs b/transcoder-core/src/cascade/client.rs
+index 2ab15e0..345bd2e 100644
+--- a/transcoder-core/src/cascade/client.rs
++++ b/transcoder-core/src/cascade/client.rs
+@@ -6,11 +6,16 @@ use crate::proto::exa::language_server_pb::{
+ use crate::proto::exa::cortex_pb::{CortexTrajectoryType, CascadeRunStatus, CortexStepType, CortexStepStatus};
+ use crate::proto::exa::codeium_common_pb::{Metadata, TextOrScopeItem};
+ use crate::proto::exa::reactive_component_pb::{StreamReactiveUpdatesRequest, MessageDiff};
++use crate::mappers::CascadeDelta; // 👈 引入新的增量类型
+ use tokio::time::sleep;
+ use std::time::Duration;
+ use tokio_stream::StreamExt;
+ 
+ pub struct CascadeClient {
++// ... (omitting new() for brevity, it's already there)
++// Wait, I should include the whole impl block or use replace_file_content carefully.
++
++// Let's refine the replacement to the chat_stream method.
+     client: LanguageServerServiceClient<Channel>,
+     metadata: Metadata,
+     auth_token: String,
+@@ -157,12 +162,32 @@ impl CascadeClient {
+     }
+ 
+     /// 发起一次 Cascade 对话并开启流式增量输出
+-    pub async fn chat_stream(&mut self, user_text: String, model_id: i32) -> anyhow::Result<tokio::sync::mpsc::Receiver<Result<String, tonic::Status>>> {
++    pub async fn chat_stream(
++        &mut self, 
++        user_text: String, 
++        model_id: i32, 
++        images: Vec<crate::proto::exa::codeium_common_pb::ImageData>,
++        media: Vec<crate::proto::exa::codeium_common_pb::Media>,
++    ) -> Result<tokio::sync::mpsc::Receiver<Result<CascadeDelta, tonic::Status>>, anyhow::Error> {
+         let (tx, rx) = tokio::sync::mpsc::channel(128);
+         let model_enum = model_id;
+         let mut client_clone = self.client.clone();
+         let csrf_token_clone = self.auth_token.clone();
+ 
++        // 构造统一的 CascadeConfig
++        let cascade_config = Some(crate::proto::exa::cortex_pb::CascadeConfig {
++            planner_config: Some(crate::proto::exa::cortex_pb::CascadePlannerConfig {
++                requested_model: Some(crate::proto::exa::codeium_common_pb::ModelOrAlias {
++                    choice: Some(crate::proto::exa::codeium_common_pb::model_or_alias::Choice::Model(model_enum)),
++                }),
++                planner_type_config: Some(crate::proto::exa::cortex_pb::cascade_planner_config::PlannerTypeConfig::Conversational(
++                    crate::proto::exa::cortex_pb::CascadeConversationalPlannerConfig::default()
++                )),
++                ..Default::default()
++            }),
++            ..Default::default()
++        });
++
+         // 1. StartCascade
+         let start_req = StartCascadeRequest {
+             metadata: Some(self.metadata.clone()),
+@@ -176,6 +201,10 @@ impl CascadeClient {
+         let cascade_id = start_resp.cascade_id;
+         tracing::info!("🚀 [Cascade] 已启动会话 (流流结合): {}", cascade_id);
+ 
++        if !images.is_empty() {
++            tracing::info!("📸 [Cascade] 当前请求包含 {} 张图片(Base64) 和 {} 个媒体对象", images.len(), media.len());
++        }
++
+         // 2. SendUserCascadeMessage
+         let send_req = SendUserCascadeMessageRequest {
+             metadata: Some(self.metadata.clone()),
+@@ -183,18 +212,9 @@ impl CascadeClient {
+             items: vec![TextOrScopeItem {
+                 chunk: Some(crate::proto::exa::codeium_common_pb::text_or_scope_item::Chunk::Text(user_text)),
+             }],
+-            cascade_config: Some(crate::proto::exa::cortex_pb::CascadeConfig {
+-                planner_config: Some(crate::proto::exa::cortex_pb::CascadePlannerConfig {
+-                    requested_model: Some(crate::proto::exa::codeium_common_pb::ModelOrAlias {
+-                        choice: Some(crate::proto::exa::codeium_common_pb::model_or_alias::Choice::Model(model_enum)),
+-                    }),
+-                    planner_type_config: Some(crate::proto::exa::cortex_pb::cascade_planner_config::PlannerTypeConfig::Conversational(
+-                        crate::proto::exa::cortex_pb::CascadeConversationalPlannerConfig::default()
+-                    )),
+-                    ..Default::default()
+-                }),
+-                ..Default::default()
+-            }),
++            images,
++            media,
++            cascade_config,
+             ..Default::default()
+         };
+         self.client.send_user_cascade_message(self.auth_request(send_req)).await.map_err(|status| {
+@@ -202,34 +222,12 @@ impl CascadeClient {
+             anyhow::anyhow!("SendUserCascadeMessage 错误 [{}]: {}", status.code(), status.message())
+         })?;
+ 
+-        // 3. 开启原生 Reactive 订阅流 + 轮询 Fallback
++        // 3. 轮询 Fallback 与 最终快照确认
+         tokio::spawn(async move {
+-            let mut last_sent_len = 0;
+-
+-            // --- 策略 A: 优先使用原生的 StreamCascadeReactiveUpdates ---
+-            let stream_req = StreamReactiveUpdatesRequest {
+-                protocol_version: 1,
+-                id: cascade_id.clone(),
+-                subscriber_id: uuid::Uuid::new_v4().to_string(),
+-            };
+-            
+-            // ⚠️ 紧急修补：PR 7 中补齐了 CSRF Token，导致原本会被服务器 403 拒绝的
+-            // Reactive Stream 成功建立了连接。但由于目前解析 `diff` 结构可能未完全对齐新版，
+-            // 或者此端点流机制极易卡死（挂起不发数据），进而导致此处的 `stream.next().await` 死锁，
+-            // 并阻断了下方能稳健出字的【策略 B：轮询兜底快照】的执行！
+-            // 
+-            // 在协议彻底对齐前，强制屏蔽策略 A，全部降级执行轮询：
+-            // (修复 E0412 编译错误，直接强制跳过此块即可，无需显式 Option 类型推断)
+-
+-            if false {
+-                // 原有的流处理逻辑被屏蔽
+-                let mut fake_stream = tokio_stream::empty::<i32>();
+-                while let Some(_) = fake_stream.next().await {}
+-            }
+-
+-            // --- 策略 B: 轮询 Fallback 与 最终快照确认 ---
+-            // 即使策略 A 跑完了或者挂了，我们也需要通过轮询确认最终状态 (是否 Done/Error)
++            let mut last_text_sent_len = 0;
++            let mut last_thinking_sent_len = 0;
+             let mut retry_count = 0;
++
+             loop {
+                 let mut req = Request::new(GetCascadeTrajectoryRequest {
+                     cascade_id: cascade_id.clone(),
+@@ -241,31 +239,37 @@ impl CascadeClient {
+                     Ok(resp) => {
+                         let traj_resp = resp.into_inner();
+                         if let Some(traj) = &traj_resp.trajectory {
+-                            // 增量补发逻辑
+-                            let full_text = traj.steps.iter().rev()
++                            // 查找最新的 PlannerResponse
++                            let planner_res = traj.steps.iter().rev()
+                                 .filter(|s| s.r#type == CortexStepType::PlannerResponse as i32)
+                                 .find_map(|s| {
+                                     if let Some(crate::proto::gemini_coder::step::Step::PlannerResponse(pr)) = &s.step {
+-                                        Some(pr.response.clone())
++                                        Some(pr)
+                                     } else { None }
+-                                }).unwrap_or_default();
++                                });
+ 
+-                            if full_text.len() > last_sent_len {
+-                                let delta = &full_text[last_sent_len..];
+-                                if tx.send(Ok(delta.to_string())).await.is_err() { break; }
+-                                last_sent_len = full_text.len();
++                            if let Some(pr) = planner_res {
++                                // 处理正文 Text
++                                if pr.response.len() > last_text_sent_len {
++                                    let delta = &pr.response[last_text_sent_len..];
++                                    if tx.send(Ok(CascadeDelta::Text(delta.to_string()))).await.is_err() { break; }
++                                    last_text_sent_len = pr.response.len();
++                                }
++                                // 处理思考链 Thinking (字段 3)
++                                if pr.thinking.len() > last_thinking_sent_len {
++                                    let delta = &pr.thinking[last_thinking_sent_len..];
++                                    if tx.send(Ok(CascadeDelta::Thinking(delta.to_string()))).await.is_err() { break; }
++                                    last_thinking_sent_len = pr.thinking.len();
++                                }
+                             }
+ 
+-                            // 状态退出逻辑：对齐 ls-transcoder-rs1 的退出条件
+-                            // rs1: Idle && retry_count > 10，无条件退出，不管有没有内容
++                            // 状态退出逻辑
+                             if traj_resp.status == CascadeRunStatus::Idle as i32 && retry_count > 10 {
+                                 break;
+                             }
+                         }
+                         
+-                        // 紧急兜底逻辑：防止任何情况下无限循环
+-                        if retry_count > 100 {
+-                             tracing::warn!("⚠️ [Cascade] 超过最大轮询次数 (100), 强制退出");
++                        if retry_count > 120 { // 约 1 分钟超时
+                              break;
+                         }
+                     }
+diff --git a/transcoder-core/src/mappers/anthropic.rs b/transcoder-core/src/mappers/anthropic.rs
+index cdd6f8f..a9ada00 100644
+--- a/transcoder-core/src/mappers/anthropic.rs
++++ b/transcoder-core/src/mappers/anthropic.rs
+@@ -18,8 +18,11 @@ impl ProtocolMapper for AnthropicMapper {
+         &req.model
+     }
+ 
+-    fn build_prompt(req: &Self::Request) -> Result<String> {
++    fn build_prompt(req: &Self::Request) -> Result<crate::mappers::ParsedPrompt> {
+         let mut prompt = String::new();
++        let mut images = Vec::new();
++        let mut media = Vec::new();
++
+         if let Some(tools) = &req.tools {
+             let unified_tools = tools.iter().map(|t| crate::tools::UnifiedToolDefinition {
+                 name: t.name.clone(),
+@@ -51,6 +54,33 @@ impl ProtocolMapper for AnthropicMapper {
+                             "text" => {
+                                 if let Some(t) = block.get("text").and_then(|v| v.as_str()) { prompt.push_str(t); }
+                             }
++                            "image" => {
++                                if let Some(source) = block.get("source") {
++                                    if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
++                                        if let Some(data) = source.get("data").and_then(|d| d.as_str()) {
++                                            let mime_type = source.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/jpeg").to_string();
++                                            
++                                            use base64::Engine as _;
++                                            let decoded = base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default();
++
++                                            images.push(crate::proto::exa::codeium_common_pb::ImageData {
++                                                base64_data: data.to_string(),
++                                                mime_type: mime_type.clone(),
++                                                caption: String::new(),
++                                                uri: String::new(),
++                                            });
++                                            media.push(crate::proto::exa::codeium_common_pb::Media {
++                                                mime_type: mime_type.clone(),
++                                                description: String::new(),
++                                                uri: String::new(),
++                                                thumbnail: vec![],
++                                                duration_seconds: 0.0,
++                                                payload: Some(crate::proto::exa::codeium_common_pb::media::Payload::InlineData(decoded)),
++                                            });
++                                        }
++                                    }
++                                }
++                            }
+                             "tool_use" => {
+                                 if let Some(n) = block.get("name").and_then(|v| v.as_str()) {
+                                     let args = block.get("input").map(|v| v.to_string()).unwrap_or_default();
+@@ -83,7 +113,7 @@ impl ProtocolMapper for AnthropicMapper {
+             }
+             prompt.push('\n');
+         }
+-        Ok(prompt)
++        Ok(crate::mappers::ParsedPrompt { text: prompt, images, media })
+     }
+ 
+     fn initial_chunks() -> Vec<MapperChunk> {
+@@ -101,7 +131,7 @@ impl ProtocolMapper for AnthropicMapper {
+ 
+     async fn map_delta(
+         _model: &str,
+-        delta: String,
++        delta: crate::mappers::CascadeDelta, // Update to CascadeDelta
+         is_final: bool,
+         tool_call_buffer: &mut String,
+         in_tool_call: &mut bool,
+@@ -119,75 +149,84 @@ impl ProtocolMapper for AnthropicMapper {
+             return Ok(results);
+         }
+ 
+-        let mut pending_text = delta;
+-        while !pending_text.is_empty() {
+-            if !*in_tool_call {
+-                if let Some(start_idx) = pending_text.find("<tool_call>") {
+-                    let before_text = &pending_text[..start_idx];
+-                    let current_text_index = *tool_call_index * 2;
+-                    if !before_text.is_empty() {
+-                        let delta_json = json!({ "type": "content_block_delta", "index": current_text_index, "delta": { "type": "text_delta", "text": before_text } });
+-                        results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
+-                    }
+-                    *in_tool_call = true;
+-                    // Stop current text block
+-                    results.push(MapperChunk { event: Some("content_block_stop".into()), data: format!(r#"{{"type":"content_block_stop","index":{}}}"#, current_text_index) });
+-
+-                    pending_text = pending_text[start_idx + "<tool_call>".len()..].to_string();
+-                } else {
+-                    let text_index = *tool_call_index * 2;
+-                    let delta_json = json!({ "type": "content_block_delta", "index": text_index, "delta": { "type": "text_delta", "text": pending_text } });
+-                    results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
+-                    pending_text = String::new();
+-                }
+-            } else {
+-                if let Some(end_idx) = pending_text.find("</tool_call>") {
+-                    let inner_text = &pending_text[..end_idx];
+-                    tool_call_buffer.push_str(inner_text);
+-                    
+-                    let trim_buf = tool_call_buffer.trim();
+-                    let tool_idx = *tool_call_index * 2 + 1; // Tool block index
+-                    let next_text_idx = *tool_call_index * 2 + 2; // Next text block index
+-
+-                    if !trim_buf.is_empty() {
+-                        if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(trim_buf) {
+-                            let name = json_obj.get("name").and_then(|v| v.as_str()).unwrap_or("unknown_tool").to_string();
+-                            let args = json_obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
+-                            
+-                            results.push(MapperChunk {
+-                                event: Some("content_block_start".into()),
+-                                data: json!({ "type": "content_block_start", "index": tool_idx, "content_block": { "type": "tool_use", "id": format!("toolu_cascade_{}", *tool_call_index), "name": name, "input": {} } }).to_string(),
+-                            });
++        match delta {
++            crate::mappers::CascadeDelta::Thinking(_) => {
++                // 🚀 Anthropic 原生协议尚无标准 Reasoning 块，且用户要求不出现在正文。
++                // 因此在这里我们跳过 Thinking 块的处理，或者未来可以映射为特定的 content block 类型。
++                return Ok(results);
++            }
++            crate::mappers::CascadeDelta::Text(text) => {
++                let mut pending_text = text;
++                while !pending_text.is_empty() {
++                    if !*in_tool_call {
++                        if let Some(start_idx) = pending_text.find("<tool_call>") {
++                            let before_text = &pending_text[..start_idx];
++                            let current_text_index = *tool_call_index * 2;
++                            if !before_text.is_empty() {
++                                let delta_json = json!({ "type": "content_block_delta", "index": current_text_index, "delta": { "type": "text_delta", "text": before_text } });
++                                results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
++                            }
++                            *in_tool_call = true;
++                            // Stop current text block
++                            results.push(MapperChunk { event: Some("content_block_stop".into()), data: format!(r#"{{"type":"content_block_stop","index":{}}}"#, current_text_index) });
++
++                            pending_text = pending_text[start_idx + "<tool_call>".len()..].to_string();
++                        } else {
++                            let text_index = *tool_call_index * 2;
++                            let delta_json = json!({ "type": "content_block_delta", "index": text_index, "delta": { "type": "text_delta", "text": pending_text } });
++                            results.push(MapperChunk { event: Some("content_block_delta".into()), data: delta_json.to_string() });
++                            pending_text = String::new();
++                        }
++                    } else {
++                        if let Some(end_idx) = pending_text.find("</tool_call>") {
++                            let inner_text = &pending_text[..end_idx];
++                            tool_call_buffer.push_str(inner_text);
+                             
+-                            let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+-                            results.push(MapperChunk {
+-                                event: Some("content_block_delta".into()),
+-                                data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "input_json_delta", "partial_json": args_str } }).to_string(),
+-                            });
++                            let trim_buf = tool_call_buffer.trim();
++                            let tool_idx = *tool_call_index * 2 + 1; // Tool block index
++                            let next_text_idx = *tool_call_index * 2 + 2; // Next text block index
++
++                            if !trim_buf.is_empty() {
++                                if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(trim_buf) {
++                                    let name = json_obj.get("name").and_then(|v| v.as_str()).unwrap_or("unknown_tool").to_string();
++                                    let args = json_obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
++                                    
++                                    results.push(MapperChunk {
++                                        event: Some("content_block_start".into()),
++                                        data: json!({ "type": "content_block_start", "index": tool_idx, "content_block": { "type": "tool_use", "id": format!("toolu_cascade_{}", *tool_call_index), "name": name, "input": {} } }).to_string(),
++                                    });
++                                    
++                                    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
++                                    results.push(MapperChunk {
++                                        event: Some("content_block_delta".into()),
++                                        data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "input_json_delta", "partial_json": args_str } }).to_string(),
++                                    });
++                                    
++                                    results.push(MapperChunk {
++                                        event: Some("content_block_stop".into()),
++                                        data: json!({ "type": "content_block_stop", "index": tool_idx }).to_string(),
++                                    });
++                                    *tool_call_index += 1;
++                                } else {
++                                    let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
++                                    results.push(MapperChunk {
++                                        event: Some("content_block_delta".into()),
++                                        data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "text_delta", "text": fallback } }).to_string()
++                                    });
++                                }
++                            }
++
++                            pending_text = pending_text[end_idx + "</tool_call>".len()..].to_string();
++                            *in_tool_call = false;
++                            tool_call_buffer.clear();
+                             
+-                            results.push(MapperChunk {
+-                                event: Some("content_block_stop".into()),
+-                                data: json!({ "type": "content_block_stop", "index": tool_idx }).to_string(),
+-                            });
+-                            *tool_call_index += 1;
++                            // Open the next text block
++                            results.push(MapperChunk { event: Some("content_block_start".into()), data: format!(r#"{{"type":"content_block_start","index":{},"content_block":{{"type":"text","text":""}}}}"#, next_text_idx) });
+                         } else {
+-                            let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
+-                            results.push(MapperChunk {
+-                                event: Some("content_block_delta".into()),
+-                                data: json!({ "type": "content_block_delta", "index": tool_idx, "delta": { "type": "text_delta", "text": fallback } }).to_string()
+-                            });
++                            tool_call_buffer.push_str(&pending_text);
++                            pending_text = String::new();
+                         }
+                     }
+-
+-                    pending_text = pending_text[end_idx + "</tool_call>".len()..].to_string();
+-                    *in_tool_call = false;
+-                    tool_call_buffer.clear();
+-                    
+-                    // Open the next text block
+-                    results.push(MapperChunk { event: Some("content_block_start".into()), data: format!(r#"{{"type":"content_block_start","index":{},"content_block":{{"type":"text","text":""}}}}"#, next_text_idx) });
+-                } else {
+-                    tool_call_buffer.push_str(&pending_text);
+-                    pending_text = String::new();
+                 }
+             }
+         }
+diff --git a/transcoder-core/src/mappers/engine.rs b/transcoder-core/src/mappers/engine.rs
+index efac892..deb735b 100644
+--- a/transcoder-core/src/mappers/engine.rs
++++ b/transcoder-core/src/mappers/engine.rs
+@@ -16,10 +16,6 @@ pub async fn handle_generic_stream<M: ProtocolMapper>(
+ ) -> Result<mpsc::Receiver<MapperChunk>> {
+     let (tx, rx) = mpsc::channel(128);
+ 
+-    // 🚀 深度重构：将首次连接建立过程前置到 spawn 之前
+-    // 这样如果发生 403 (PERMISSION_DENIED)，我们可以直接返回 Result::Err，
+-    // 从而让外层 chat.rs 能返回真实的 HTTP 403 状态码。
+-    
+     let config = crate::common::get_runtime_config();
+     let metadata = Metadata {
+         ide_name: config.ide_name,
+@@ -30,15 +26,24 @@ pub async fn handle_generic_stream<M: ProtocolMapper>(
+     };
+ 
+     let model_name = M::get_model(&req).to_string();
+-    let prompt = M::build_prompt(&req)?;
+-
+-    // 🚀 工作区路径解析：优先使用 conn.workspace_dir，其次从请求 system prompt 中提取
+-    let resolved_workspace = conn.workspace_dir.clone()
+-        .or_else(|| M::extract_workspace(&req));
+-    if let Some(ref ws) = resolved_workspace {
+-        tracing::info!("📁 [Engine] 解析到工作区路径: {}", ws);
++    let parsed = M::build_prompt(&req)?;
++    let mut prompt = parsed.text;
++    let images = parsed.images;
++    let media = parsed.media;
++
++    // 🚀 思考语言增强与 VCoT 注入
++    let is_lite = model_name.to_lowercase().contains("lite");
++    if is_lite {
++        // 对于 Lite 模型，通过 Prompt 注入强制开启虚拟思考链 (VCoT)
++        prompt = format!("[System Instruction]\nYou must first perform a step-by-step reasoning process within <thought>...</thought> tags before providing your final answer. Please reason in Chinese. (请务必先并在 <thought> 标签内使用中文进行过程推理，然后再给出最终答案)\n\n{}", prompt);
++    } else {
++        // 对于原生支持 Thinking 的模型，仅注入语言引导
++        prompt = format!("[System Instruction]\nPlease reason in Chinese. (请务必使用中文进行思考)\n\n{}", prompt);
+     }
+ 
++    // 🚀 工作区路径解析
++    let resolved_workspace = conn.workspace_dir.clone().or_else(|| M::extract_workspace(&req));
++
+     // 尝试建立连接
+     let mut client = crate::cascade::CascadeClient::new(
+         conn.grpc_addr.clone(),
+@@ -46,30 +51,10 @@ pub async fn handle_generic_stream<M: ProtocolMapper>(
+         conn.csrf_token.clone().unwrap_or_default(),
+         conn.tls_cert.clone(),
+         resolved_workspace,
+-    ).await.map_err(|e| {
+-        // 如果连接阶段就发现 403 迹象（通过 ErrorFetcher）
+-        if let Some(ref fetcher) = conn.error_fetcher {
+-            if let Some(raw_err) = fetcher.get_last_error() {
+-                if raw_err.contains("PERMISSION_DENIED") || raw_err.contains("Verify your account") {
+-                    return anyhow::anyhow!("{}", raw_err);
+-                }
+-            }
+-        }
+-        e 
+-    })?;
++    ).await?;
+ 
+     // 发起流式请求
+-    let mut rx_cascade = client.chat_stream(prompt.clone(), conn.resolved_model_id).await.map_err(|e| {
+-        // 如果请求阶段发现 403 迹象
+-        if let Some(ref fetcher) = conn.error_fetcher {
+-            if let Some(raw_err) = fetcher.get_last_error() {
+-                if raw_err.contains("PERMISSION_DENIED") || raw_err.contains("Verify your account") {
+-                    return anyhow::anyhow!("{}", raw_err);
+-                }
+-            }
+-        }
+-        e
+-    })?;
++    let mut rx_cascade = client.chat_stream(prompt.clone(), conn.resolved_model_id, images, media).await?;
+ 
+     // 🚀 关键改进：尝试读取第一帧。如果 LS 直接关闭流且 stderr 有 403，则截获
+     let first_res = rx_cascade.recv().await;
+@@ -77,22 +62,12 @@ pub async fn handle_generic_stream<M: ProtocolMapper>(
+         Some(Err(status)) if status.code() == tonic::Code::PermissionDenied => {
+              return Err(anyhow::anyhow!("{}", status.message()));
+         }
+-        None => {
+-            // 流直接结束（空流），检查 stderr
+-            if let Some(ref fetcher) = conn.error_fetcher {
+-                if let Some(raw_err) = fetcher.get_last_error() {
+-                    if raw_err.contains("PERMISSION_DENIED") || raw_err.contains("Verify your account") {
+-                        return Err(anyhow::anyhow!("{}", raw_err));
+-                    }
+-                }
+-            }
+-        }
+         _ => {}
+     }
+ 
+     // 握手成功或已有数据，启动后台循环处理剩余工作
+     tokio::spawn(async move {
+-        if let Err(e) = run_transcode_loop_with_client::<M>(req, conn, tx.clone(), stats_mgr, meta_tx, client, rx_cascade, model_name, prompt, first_res).await {
++        if let Err(e) = run_transcode_loop_with_client::<M>(tx.clone(), conn, stats_mgr, meta_tx, client, rx_cascade, model_name, is_lite, prompt, first_res).await {
+             error!("转码引擎内部异常: {:?}", e);
+         }
+     });
+@@ -100,92 +75,57 @@ pub async fn handle_generic_stream<M: ProtocolMapper>(
+     Ok(rx)
+ }
+ 
++/// VCoT 解析器状态
++enum VCoTState {
++    Outside,
++    Inside,
++}
++
+ async fn run_transcode_loop_with_client<M: ProtocolMapper>(
+-    _req: M::Request,
+-    conn: LsConnectionInfo,
+     tx: mpsc::Sender<MapperChunk>,
++    conn: LsConnectionInfo,
+     stats_mgr: Option<std::sync::Arc<crate::stats::StatsManager>>,
+     mut meta_tx: Option<tokio::sync::oneshot::Sender<StreamMetadata>>,
+     mut _client: crate::cascade::CascadeClient,
+-    mut rx_cascade: mpsc::Receiver<Result<String, tonic::Status>>,
++    mut rx_cascade: mpsc::Receiver<Result<crate::mappers::CascadeDelta, tonic::Status>>,
+     model_name: String,
++    is_lite: bool,
+     prompt: String,
+-    first_res: Option<Result<String, tonic::Status>>,
++    first_res: Option<Result<crate::mappers::CascadeDelta, tonic::Status>>,
+ ) -> Result<()> {
+-    // 提升状态变量
+     let mut tool_call_buffer = String::new();
+     let mut in_tool_call = false;
+     let mut tool_call_index = 0u32;
++    let mut vcot_state = VCoTState::Outside;
+ 
+-    // 发送初始帧
+     for chunk in M::initial_chunks() {
+         let _ = tx.send(chunk).await;
+     }
+ 
+     let mut full_response_content = String::new();
+-    let mut sent_errors = std::collections::HashSet::new();
+-
+-    // 先处理第一帧（如果有）
+-    let process_res = |res: Result<String, tonic::Status>, full_content: &mut String, sent_errs: &mut std::collections::HashSet<String>, 
+-                       tc_buf: &mut String, in_tc: &mut bool, tc_idx: &mut u32, tx: &mpsc::Sender<MapperChunk>| -> Result<Option<String>> {
+-        match res {
+-            Ok(delta) => {
+-                full_content.push_str(&delta);
+-                // 模拟简单的 map_delta 逻辑（此处逻辑与主循环一致，为了不重复代码可暂略或内联）
+-                return Ok(Some(delta));
+-            }
+-            Err(status) => {
+-                return Err(anyhow::anyhow!(format!("gRPC 错误 [{}]: {}", status.code(), status.message())));
+-            }
+-        }
+-    };
+ 
+     if let Some(res) = first_res {
+-        match process_res(res, &mut full_response_content, &mut sent_errors, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index, &tx) {
+-            Ok(Some(delta)) => {
+-                let chunks = M::map_delta(&model_name, delta, false, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+-                for chunk in chunks { let _ = tx.send(chunk).await; }
+-            }
+-            Err(e) => {
+-                let _ = send_error_to_user::<M>(&tx, &model_name, &e.to_string(), &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await;
+-                return Err(e);
+-            }
+-            _ => {}
+-        }
++        process_one_delta::<M>(&tx, &model_name, is_lite, res, &mut vcot_state, &mut full_response_content, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+     }
+ 
+-    // 继续处理剩余流
+     while let Some(res) = rx_cascade.recv().await {
+-        match res {
+-            Ok(delta) => {
+-                full_response_content.push_str(&delta);
+-                let chunks = M::map_delta(&model_name, delta, false, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+-                for chunk in chunks { let _ = tx.send(chunk).await; }
+-            }
+-            Err(status) => {
+-                let err_msg = format!("gRPC 错误 [{}]: {}", status.code(), status.message());
+-                let _ = send_error_to_user::<M>(&tx, &model_name, &err_msg, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await;
+-                return Err(anyhow::anyhow!(err_msg));
+-            }
+-        }
++        process_one_delta::<M>(&tx, &model_name, is_lite, res, &mut vcot_state, &mut full_response_content, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+     }
+ 
+-    // 🚀 核心兜底逻辑：如果流执行完毕但没有任何内容产出，通常意味着 LS 进程发生了静默报错（如 403）
++    // 🚀 核心兜底逻辑：如果流执行完毕但没有任何内容产出，通常意味着 LS 进程发生了静默报错
+     if full_response_content.is_empty() {
+-         let mut err_msg = "内核返回内容为空，且未抓取到具体报错。请检查账号状态。".to_string();
++         let mut err_msg = "内核返回内容为空，可能触发了 403 权限或网络异常。".to_string();
+          if let Some(ref fetcher) = conn.error_fetcher {
+-             if let Some(raw_err) = fetcher.get_last_error() {
+-                 err_msg = raw_err;
+-             }
++             if let Some(raw_err) = fetcher.get_last_error() { err_msg = raw_err; }
+          }
+          let _ = send_error_to_user::<M>(&tx, &model_name, &err_msg, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await;
+     }
+ 
+     // 发送结束帧
+-    let final_chunks = M::map_delta(&model_name, String::new(), true, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
++    let final_chunks = M::map_delta(&model_name, crate::mappers::CascadeDelta::Text(String::new()), true, &mut tool_call_buffer, &mut in_tool_call, &mut tool_call_index).await?;
+     for chunk in final_chunks { let _ = tx.send(chunk).await; }
+ 
+-    // 统计逻辑...
++    // 统计量
+     let input_tokens = (prompt.len() / 4).max(1) as u32;
+     let output_tokens = (full_response_content.len() / 4).max(1) as u32;
+     if let Some(mgr) = stats_mgr {
+@@ -200,7 +140,81 @@ async fn run_transcode_loop_with_client<M: ProtocolMapper>(
+     Ok(())
+ }
+ 
+-/// 辅助函数：将错误信息发送给终端用户 (极简模式：直接输出原始文本)
++async fn process_one_delta<M: ProtocolMapper>(
++    tx: &mpsc::Sender<MapperChunk>,
++    model_name: &str,
++    is_lite: bool,
++    res: Result<crate::mappers::CascadeDelta, tonic::Status>,
++    state: &mut VCoTState,
++    full_content: &mut String,
++    tc_buf: &mut String,
++    in_tc: &mut bool,
++    tc_idx: &mut u32,
++) -> Result<()> {
++    match res {
++        Ok(delta) => {
++            match delta {
++                crate::mappers::CascadeDelta::Thinking(t) => {
++                    let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Thinking(t), false, tc_buf, in_tc, tc_idx).await?;
++                    for chunk in chunks { let _ = tx.send(chunk).await; }
++                }
++                crate::mappers::CascadeDelta::Text(t) => {
++                    if !is_lite {
++                        full_content.push_str(&t);
++                        let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Text(t), false, tc_buf, in_tc, tc_idx).await?;
++                        for chunk in chunks { let _ = tx.send(chunk).await; }
++                    } else {
++                        // 🚀 核心 VCoT 剥离逻辑：拦截 <thought> 标签
++                        let mut current_text = t;
++                        while !current_text.is_empty() {
++                            match state {
++                                VCoTState::Outside => {
++                                    if let Some(start_pos) = current_text.find("<thought>") {
++                                        let prefix = &current_text[..start_pos];
++                                        if !prefix.is_empty() {
++                                            full_content.push_str(prefix);
++                                            let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Text(prefix.to_string()), false, tc_buf, in_tc, tc_idx).await?;
++                                            for chunk in chunks { let _ = tx.send(chunk).await; }
++                                        }
++                                        *state = VCoTState::Inside;
++                                        current_text = current_text[start_pos + "<thought>".len()..].to_string();
++                                    } else {
++                                        full_content.push_str(&current_text);
++                                        let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Text(current_text), false, tc_buf, in_tc, tc_idx).await?;
++                                        for chunk in chunks { let _ = tx.send(chunk).await; }
++                                        current_text = String::new();
++                                    }
++                                }
++                                VCoTState::Inside => {
++                                    if let Some(end_pos) = current_text.find("</thought>") {
++                                        let thought_part = &current_text[..end_pos];
++                                        if !thought_part.is_empty() {
++                                            let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Thinking(thought_part.to_string()), false, tc_buf, in_tc, tc_idx).await?;
++                                            for chunk in chunks { let _ = tx.send(chunk).await; }
++                                        }
++                                        *state = VCoTState::Outside;
++                                        current_text = current_text[end_pos + "</thought>".len()..].to_string();
++                                    } else {
++                                        let chunks = M::map_delta(model_name, crate::mappers::CascadeDelta::Thinking(current_text), false, tc_buf, in_tc, tc_idx).await?;
++                                        for chunk in chunks { let _ = tx.send(chunk).await; }
++                                        current_text = String::new();
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            Ok(())
++        }
++        Err(status) => {
++            let err_msg = format!("gRPC 错误 [{}]: {}", status.code(), status.message());
++            let _ = send_error_to_user::<M>(tx, model_name, &err_msg, tc_buf, in_tc, tc_idx).await;
++            Err(anyhow::anyhow!(err_msg))
++        }
++    }
++}
++
+ async fn send_error_to_user<M: ProtocolMapper>(
+     tx: &mpsc::Sender<MapperChunk>,
+     model_name: &str,
+@@ -211,15 +225,13 @@ async fn send_error_to_user<M: ProtocolMapper>(
+ ) -> Result<()> {
+     if let Ok(chunks) = M::map_delta(
+         model_name,
+-        err_msg.to_string(),
++        crate::mappers::CascadeDelta::Text(err_msg.to_string()),
+         false,
+         tool_call_buffer,
+         in_tool_call,
+         tool_call_index,
+     ).await {
+-        for chunk in chunks {
+-            let _ = tx.send(chunk).await;
+-        }
++        for chunk in chunks { let _ = tx.send(chunk).await; }
+     }
+     Ok(())
+ }
+diff --git a/transcoder-core/src/mappers/gemini.rs b/transcoder-core/src/mappers/gemini.rs
+index 4962d99..88d892e 100644
+--- a/transcoder-core/src/mappers/gemini.rs
++++ b/transcoder-core/src/mappers/gemini.rs
+@@ -19,8 +19,11 @@ impl ProtocolMapper for GeminiMapper {
+         req.model.as_deref().unwrap_or("gemini-native")
+     }
+ 
+-    fn build_prompt(req: &Self::Request) -> Result<String> {
++    fn build_prompt(req: &Self::Request) -> Result<crate::mappers::ParsedPrompt> {
+         let mut prompt = String::new();
++        let mut images = Vec::new();
++        let mut media = Vec::new();
++
+         if let Some(tools_wrapper) = &req.tools {
+             let mut unified_tools = vec![];
+             for tw in tools_wrapper {
+@@ -46,14 +49,41 @@ impl ProtocolMapper for GeminiMapper {
+             for p in &sys.parts { if let Some(t) = &p.text { prompt.push_str(t); prompt.push_str("\n\n"); } }
+         }
+         for c in &req.contents {
+-            for p in &c.parts { if let Some(t) = &p.text { prompt.push_str(t); prompt.push('\n'); } }
++            for p in &c.parts { 
++                if let Some(t) = &p.text { 
++                    prompt.push_str(t); prompt.push('\n'); 
++                } else if let Some(inline_data) = &p.inline_data {
++                    if let (Some(mime), Some(data)) = (
++                        inline_data.get("mimeType").and_then(|v| v.as_str()),
++                        inline_data.get("data").and_then(|v| v.as_str())
++                    ) {
++                        use base64::Engine as _;
++                        let decoded = base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default();
++
++                        images.push(crate::proto::exa::codeium_common_pb::ImageData {
++                            base64_data: data.to_string(),
++                            mime_type: mime.to_string(),
++                            caption: String::new(),
++                            uri: String::new(),
++                        });
++                        media.push(crate::proto::exa::codeium_common_pb::Media {
++                            mime_type: mime.to_string(),
++                            description: String::new(),
++                            uri: String::new(),
++                            thumbnail: vec![],
++                            duration_seconds: 0.0,
++                            payload: Some(crate::proto::exa::codeium_common_pb::media::Payload::InlineData(decoded)),
++                        });
++                    }
++                }
++            }
+         }
+-        Ok(prompt)
++        Ok(crate::mappers::ParsedPrompt { text: prompt, images, media })
+     }
+ 
+     async fn map_delta(
+-        _model: &str,
+-        delta: String,
++        model: &str,
++        delta: crate::mappers::CascadeDelta,
+         is_final: bool,
+         tool_call_buffer: &mut String,
+         in_tool_call: &mut bool,
+@@ -62,58 +92,95 @@ impl ProtocolMapper for GeminiMapper {
+         let mut results = vec![];
+ 
+         if is_final {
+-            results.push(MapperChunk {
+-                event: None,
+-                data: json!({ "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }] }).to_string()
++            let chunk = json!({
++                "candidates": [{
++                    "index": 0,
++                    "content": { "parts": [] },
++                    "finishReason": "STOP"
++                }],
++                "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0 }
+             });
++            results.push(MapperChunk { event: None, data: chunk.to_string() });
+             return Ok(results);
+         }
+ 
+-        let mut pending_text = delta;
+-        while !pending_text.is_empty() {
+-            if !*in_tool_call {
+-                if let Some(start_idx) = pending_text.find("<tool_call>") {
+-                    let before_text = &pending_text[..start_idx];
+-                    if !before_text.is_empty() {
+-                        let chunk_json = json!({ "candidates": [{ "content": { "parts": [{ "text": before_text }] } }] });
+-                        results.push(MapperChunk { event: None, data: chunk_json.to_string() });
+-                    }
+-                    *in_tool_call = true;
+-                    pending_text = pending_text[start_idx + "<tool_call>".len()..].to_string();
+-                } else {
+-                    let chunk_json = json!({ "candidates": [{ "content": { "parts": [{ "text": pending_text }] } }] });
+-                    results.push(MapperChunk { event: None, data: chunk_json.to_string() });
+-                    pending_text = String::new();
+-                }
+-            } else {
+-                if let Some(end_idx) = pending_text.find("</tool_call>") {
+-                    let inner_text = &pending_text[..end_idx];
+-                    tool_call_buffer.push_str(inner_text);
+-                    
+-                    let trim_buf = tool_call_buffer.trim();
+-                    if !trim_buf.is_empty() {
+-                        if let Ok(json_obj) = serde_json::from_str::<serde_json::Value>(trim_buf) {
+-                            let name = json_obj.get("name").and_then(|v| v.as_str()).unwrap_or("unknown_tool").to_string();
+-                            let args = json_obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
+-                            let chunk_json = json!({ "candidates": [{ "content": { "parts": [{ "functionCall": { "name": name, "args": args } }] }, "finishReason": "STOP" }] });
+-                            results.push(MapperChunk { event: None, data: chunk_json.to_string() });
+-                            *tool_call_index += 1;
++        match delta {
++            crate::mappers::CascadeDelta::Thinking(_) => {
++                return Ok(results);
++            }
++            crate::mappers::CascadeDelta::Text(text) => {
++                let mut pending_text = text;
++                while !pending_text.is_empty() {
++                    if !*in_tool_call {
++                        if let Some(start_idx) = pending_text.find("<tool_call>") {
++                            let before_text = &pending_text[..start_idx];
++                            if !before_text.is_empty() {
++                                results.push(MapperChunk { event: None, data: generate_gemini_chunk(model, before_text)? });
++                            }
++                            *in_tool_call = true;
++                            pending_text = pending_text[start_idx + "<tool_call>".len()..].to_string();
+                         } else {
+-                            let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
+-                            let chunk_json = json!({ "candidates": [{ "content": { "parts": [{ "text": fallback }] } }] });
+-                            results.push(MapperChunk { event: None, data: chunk_json.to_string() });
++                            results.push(MapperChunk { event: None, data: generate_gemini_chunk(model, &pending_text)? });
++                            pending_text = String::new();
++                        }
++                    } else {
++                        if let Some(end_idx) = pending_text.find("</tool_call>") {
++                            let inner_text = &pending_text[..end_idx];
++                            tool_call_buffer.push_str(inner_text);
++                            let trim_buf = tool_call_buffer.trim();
++                            if !trim_buf.is_empty() {
++                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trim_buf) {
++                                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("unknown_tool").to_string();
++                                    let args = v.get("arguments").cloned().unwrap_or_else(|| json!({}));
++                                    results.push(MapperChunk { event: None, data: generate_gemini_tool_call_chunk(model, &name, args)? });
++                                    *tool_call_index += 1;
++                                } else {
++                                    let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
++                                    results.push(MapperChunk { event: None, data: generate_gemini_chunk(model, &fallback)? });
++                                }
++                            }
++                            tool_call_buffer.clear();
++                            *in_tool_call = false;
++                            pending_text = pending_text[end_idx + "</tool_call>".len()..].to_string();
++                        } else {
++                            tool_call_buffer.push_str(&pending_text);
++                            pending_text = String::new();
+                         }
+                     }
+-
+-                    pending_text = pending_text[end_idx + "</tool_call>".len()..].to_string();
+-                    *in_tool_call = false;
+-                    tool_call_buffer.clear();
+-                } else {
+-                    tool_call_buffer.push_str(&pending_text);
+-                    pending_text = String::new();
+                 }
+             }
+         }
+         Ok(results)
+     }
+ }
++
++fn generate_gemini_chunk(_model: &str, content: &str) -> Result<String> {
++    let chunk = json!({
++        "candidates": [{
++            "index": 0,
++            "content": {
++                "role": "model",
++                "parts": [{ "text": content }]
++            }
++        }]
++    });
++    Ok(chunk.to_string())
++}
++
++fn generate_gemini_tool_call_chunk(_model: &str, name: &str, args: serde_json::Value) -> Result<String> {
++    let chunk = json!({
++        "candidates": [{
++            "index": 0,
++            "content": {
++                "role": "model",
++                "parts": [{
++                    "functionCall": {
++                        "name": name,
++                        "args": args
++                    }
++                }]
++            }
++        }]
++    });
++    Ok(chunk.to_string())
++}
+diff --git a/transcoder-core/src/mappers/mod.rs b/transcoder-core/src/mappers/mod.rs
+index 58d4bd0..e275e24 100644
+--- a/transcoder-core/src/mappers/mod.rs
++++ b/transcoder-core/src/mappers/mod.rs
+@@ -7,6 +7,8 @@ pub mod anthropic;
+ pub mod gemini;
+ pub mod engine;
+ 
++use crate::proto::exa::codeium_common_pb::{ImageData, Media};
++
+ /// 映射后的增量响应块
+ #[derive(Debug, Clone)]
+ pub struct MapperChunk {
+@@ -14,6 +16,22 @@ pub struct MapperChunk {
+     pub data: String,
+ }
+ 
++/// 底层 Cascade 返回的聚合增量数据类型
++/// 考虑到有的模型同时输出思考内容与最终文本，我们需要在流中区分它们。
++#[derive(Debug, Clone)]
++pub enum CascadeDelta {
++    Text(String),
++    Thinking(String),
++}
++
++/// 解析后的请求信息（含图片）
++#[derive(Debug, Clone)]
++pub struct ParsedPrompt {
++    pub text: String,
++    pub images: Vec<ImageData>,
++    pub media: Vec<Media>,
++}
++
+ /// 流式传输的元数据，在流结束时发送
+ #[derive(Debug, Clone, Default)]
+ pub struct StreamMetadata {
+@@ -34,13 +52,13 @@ pub trait ProtocolMapper: Send + Sync + 'static {
+     /// 获取模型名称
+     fn get_model(req: &Self::Request) -> &str;
+ 
+-    /// 将原始请求转换为底层的 Prompt 字符串
+-    fn build_prompt(req: &Self::Request) -> Result<String>;
++    /// 将原始请求转换为底层的 Prompt 与图片数据
++    fn build_prompt(req: &Self::Request) -> Result<ParsedPrompt>;
+ 
+-    /// 处理底层的增量文本，转换为特定协议的流式响应格式（Chunk）
++    /// 处理底层的增量数据，转换为特定协议的流式响应格式（Chunk）
+     async fn map_delta(
+         model: &str,
+-        delta: String,
++        delta: CascadeDelta, // 改为使用 CascadeDelta
+         is_final: bool,
+         tool_call_buffer: &mut String,
+         in_tool_call: &mut bool,
+diff --git a/transcoder-core/src/mappers/openai.rs b/transcoder-core/src/mappers/openai.rs
+index 82fe765..add7a6c 100644
+--- a/transcoder-core/src/mappers/openai.rs
++++ b/transcoder-core/src/mappers/openai.rs
+@@ -19,8 +19,11 @@ impl ProtocolMapper for OpenAiMapper {
+         &req.model
+     }
+ 
+-    fn build_prompt(req: &Self::Request) -> Result<String> {
++    fn build_prompt(req: &Self::Request) -> Result<crate::mappers::ParsedPrompt> {
+         let mut prompt = String::new();
++        let mut images = Vec::new();
++        let mut media = Vec::new();
++        
+         if let Some(tools) = &req.tools {
+             let unified_tools = tools.iter().map(|t| crate::tools::UnifiedToolDefinition {
+                 name: t.function.name.clone(),
+@@ -44,21 +47,79 @@ impl ProtocolMapper for OpenAiMapper {
+                 } else if content.is_array() {
+                     if let Some(arr) = content.as_array() {
+                         for item in arr {
+-                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+-                                prompt.push_str(t);
+-                                prompt.push('\n');
++                            if let Some(type_str) = item.get("type").and_then(|t| t.as_str()) {
++                                if type_str == "text" {
++                                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
++                                        prompt.push_str(t);
++                                        prompt.push('\n');
++                                    }
++                                } else if type_str == "image_url" {
++                                    if let Some(url) = item.get("image_url").and_then(|u| u.get("url")).and_then(|u| u.as_str()) {
++                                        if url.starts_with("data:") {
++                                            let parts: Vec<&str> = url.splitn(2, ',').collect();
++                                            if parts.len() == 2 {
++                                                let meta = parts[0];
++                                                let base64_data = parts[1].to_string();
++                                                let mime_type = if meta.len() > 5 {
++                                                    meta[5..].split(';').next().unwrap_or("image/jpeg").to_string()
++                                                } else {
++                                                    "image/jpeg".to_string()
++                                                };
++
++                                                use base64::Engine as _;
++                                                let decoded = base64::engine::general_purpose::STANDARD.decode(&base64_data).unwrap_or_default();
++
++                                                images.push(crate::proto::exa::codeium_common_pb::ImageData {
++                                                    base64_data: base64_data.clone(),
++                                                    mime_type: mime_type.clone(),
++                                                    caption: String::new(),
++                                                    uri: String::new(),
++                                                });
++                                                media.push(crate::proto::exa::codeium_common_pb::Media {
++                                                    mime_type: mime_type.clone(),
++                                                    description: String::new(),
++                                                    uri: String::new(),
++                                                    thumbnail: vec![],
++                                                    duration_seconds: 0.0,
++                                                    payload: Some(crate::proto::exa::codeium_common_pb::media::Payload::InlineData(decoded)),
++                                                });
++                                            }
++                                        } else {
++                                            images.push(crate::proto::exa::codeium_common_pb::ImageData {
++                                                base64_data: String::new(),
++                                                mime_type: "image/jpeg".to_string(),
++                                                caption: String::new(),
++                                                uri: url.to_string(),
++                                            });
++                                            media.push(crate::proto::exa::codeium_common_pb::Media {
++                                                mime_type: "image/jpeg".to_string(),
++                                                description: String::new(),
++                                                uri: url.to_string(),
++                                                thumbnail: vec![],
++                                                duration_seconds: 0.0,
++                                                payload: None,
++                                            });
++                                        }
++                                    }
++                                }
++                            } else {
++                                // Fallback
++                                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
++                                    prompt.push_str(t);
++                                    prompt.push('\n');
++                                }
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+-        Ok(prompt)
++        Ok(crate::mappers::ParsedPrompt { text: prompt, images, media })
+     }
+ 
+     async fn map_delta(
+         model: &str,
+-        delta: String,
++        delta: crate::mappers::CascadeDelta,
+         is_final: bool,
+         tool_call_buffer: &mut String,
+         in_tool_call: &mut bool,
+@@ -67,50 +128,58 @@ impl ProtocolMapper for OpenAiMapper {
+         let mut results = vec![];
+         
+         if is_final {
+-            results.push(MapperChunk { event: None, data: generate_chunk(model, "", true)? });
++            results.push(MapperChunk { event: None, data: generate_chunk(model, "", None, true)? });
+             return Ok(results);
+         }
+ 
+-        if delta.is_empty() {
+-            return Ok(results);
+-        }
+-
+-        let mut pending_text = delta;
+-        while !pending_text.is_empty() {
+-            if !*in_tool_call {
+-                if let Some(start_pos) = pending_text.find("<tool_call>") {
+-                    *in_tool_call = true;
+-                    let prefix = &pending_text[..start_pos];
+-                    if !prefix.is_empty() {
+-                        results.push(MapperChunk { event: None, data: generate_chunk(model, prefix, false)? });
+-                    }
+-                    pending_text = pending_text[start_pos + "<tool_call>".len()..].to_string();
+-                } else {
+-                    results.push(MapperChunk { event: None, data: generate_chunk(model, &pending_text, false)? });
+-                    pending_text = String::new();
++        match delta {
++            crate::mappers::CascadeDelta::Thinking(think_text) => {
++                // 🚀 核心核心适配：将思考内容映射到 reasoning_content 字段
++                if !think_text.is_empty() {
++                    results.push(MapperChunk { event: None, data: generate_chunk(model, "", Some(&think_text), false)? });
+                 }
+-            } else {
+-                if let Some(end_pos) = pending_text.find("</tool_call>") {
+-                    let inner_text = &pending_text[..end_pos];
+-                    tool_call_buffer.push_str(inner_text);
+-                    let trim_buf = tool_call_buffer.trim();
+-                    if !trim_buf.is_empty() {
+-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trim_buf) {
+-                            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("unknown_tool").to_string();
+-                            let args = v.get("arguments").map(|a| if let Some(s) = a.as_str() { s.to_string() } else { a.to_string() }).unwrap_or_else(|| "{}".to_string());
+-                            results.push(MapperChunk { event: None, data: generate_tool_call_chunk(model, &name, &args, *tool_call_index)? });
+-                            *tool_call_index += 1;
++            }
++            crate::mappers::CascadeDelta::Text(text) => {
++                if text.is_empty() { return Ok(results); }
++
++                let mut pending_text = text;
++                while !pending_text.is_empty() {
++                    if !*in_tool_call {
++                        if let Some(start_pos) = pending_text.find("<tool_call>") {
++                            *in_tool_call = true;
++                            let prefix = &pending_text[..start_pos];
++                            if !prefix.is_empty() {
++                                results.push(MapperChunk { event: None, data: generate_chunk(model, prefix, None, false)? });
++                            }
++                            pending_text = pending_text[start_pos + "<tool_call>".len()..].to_string();
+                         } else {
+-                            let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
+-                            results.push(MapperChunk { event: None, data: generate_chunk(model, &fallback, false)? });
++                            results.push(MapperChunk { event: None, data: generate_chunk(model, &pending_text, None, false)? });
++                            pending_text = String::new();
++                        }
++                    } else {
++                        if let Some(end_pos) = pending_text.find("</tool_call>") {
++                            let inner_text = &pending_text[..end_pos];
++                            tool_call_buffer.push_str(inner_text);
++                            let trim_buf = tool_call_buffer.trim();
++                            if !trim_buf.is_empty() {
++                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trim_buf) {
++                                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("unknown_tool").to_string();
++                                    let args = v.get("arguments").map(|a| if let Some(s) = a.as_str() { s.to_string() } else { a.to_string() }).unwrap_or_else(|| "{}".to_string());
++                                    results.push(MapperChunk { event: None, data: generate_tool_call_chunk(model, &name, &args, *tool_call_index)? });
++                                    *tool_call_index += 1;
++                                } else {
++                                    let fallback = format!("<tool_call>{}</tool_call>", trim_buf);
++                                    results.push(MapperChunk { event: None, data: generate_chunk(model, &fallback, None, false)? });
++                                }
++                            }
++                            tool_call_buffer.clear();
++                            *in_tool_call = false;
++                            pending_text = pending_text[end_pos + "</tool_call>".len()..].to_string();
++                        } else {
++                            tool_call_buffer.push_str(&pending_text);
++                            pending_text = String::new();
+                         }
+                     }
+-                    tool_call_buffer.clear();
+-                    *in_tool_call = false;
+-                    pending_text = pending_text[end_pos + "</tool_call>".len()..].to_string();
+-                } else {
+-                    tool_call_buffer.push_str(&pending_text);
+-                    pending_text = String::new();
+                 }
+             }
+         }
+@@ -119,8 +188,18 @@ impl ProtocolMapper for OpenAiMapper {
+     }
+ }
+ 
+-fn generate_chunk(model: &str, content: &str, is_final: bool) -> Result<String> {
++fn generate_chunk(model: &str, content: &str, reasoning_content: Option<&str>, is_final: bool) -> Result<String> {
+     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
++    
++    let delta = if is_final {
++        json!({})
++    } else if let Some(reasoning) = reasoning_content {
++        // 🚀 OpenAI 官方标准的 reasoning_content 字段
++        json!({ "reasoning_content": reasoning })
++    } else {
++        json!({ "content": content })
++    };
++
+     let chunk = json!({
+         "id": format!("chatcmpl-cascade-{}", uuid::Uuid::new_v4()),
+         "object": "chat.completion.chunk",
+@@ -128,7 +207,7 @@ fn generate_chunk(model: &str, content: &str, is_final: bool) -> Result<String>
+         "model": model,
+         "choices": [{
+             "index": 0,
+-            "delta": if is_final { json!({}) } else { json!({ "content": content }) },
++            "delta": delta,
+             "finish_reason": if is_final { json!("stop") } else { serde_json::Value::Null }
+         }]
+     });
